@@ -1,125 +1,77 @@
-from fastapi import FastAPI, File, UploadFile, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores.chroma import Chroma
+from langchain.vectorstores import Chroma
+from langchain.prompts import ChatPromptTemplate
 from langchain_anthropic import ChatAnthropic
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate
-
-from chromadb import PersistentClient
-
-import tempfile
-import traceback
-import os
 from dotenv import load_dotenv
+import os
+import shutil
+import uuid
 
-# Load environment variables
+app = FastAPI()
 load_dotenv()
+
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
-# Path to persist ChromaDB
-CHROMA_DIR = "./chroma_db"
-COLLECTION_NAME = "pdf_store"
 
-# Create FastAPI app
-app = FastAPI()
+db_chroma = None
 
-@app.get("/")
-def read_root():
-    return {"message": "Welcome to the PDF Vector Store API. Use /docs to explore endpoints."}
+@app.post("/upload-pdf")
+async def upload_pdf(file: UploadFile = File(...)):
+    global db_chroma
 
+    # Save uploaded file to a temporary location
+    file_id = str(uuid.uuid4())
+    temp_path = f"/tmp/{file_id}_{file.filename}"
+    with open(temp_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
 
-@app.post("/embed_pdf/")
-async def embed_pdf(file: UploadFile = File(...)):
-    file_path = ""
+    # Load and process PDF
     try:
-        # Save uploaded file temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(await file.read())
-            file_path = tmp.name
+        loader = PyPDFLoader(temp_path)
+        pages = loader.load()
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+        chunks = text_splitter.split_documents(pages)
 
-        # Load and split the PDF content
-        loader = PyPDFLoader(file_path)
-        docs = loader.load()
-        if not docs:
-            raise ValueError("No readable content found in the PDF.")
-
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-        splits = text_splitter.split_documents(docs)
-
-        # Light embedding model
         embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-MiniLM-L3-v2")
+        db_chroma = Chroma.from_documents(chunks, embeddings)
 
-        # ChromaDB client and vector store
-        client = PersistentClient(path=CHROMA_DIR)
-        vectorstore = Chroma.from_documents(
-            documents=splits,
-            embedding=embeddings,
-            collection_name=COLLECTION_NAME,
-            client=client
-        )
-
-        return JSONResponse(content={"message": f"{len(splits)} chunks embedded and stored successfully."})
-
+        return {"message": "PDF uploaded and indexed successfully."}
     except Exception as e:
-        traceback.print_exc()
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-    finally:
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
+        raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
 
 
-@app.post("/ask_question/")
+@app.post("/ask-question")
 async def ask_question(question: str = Form(...)):
+    global db_chroma
+
+    if db_chroma is None:
+        raise HTTPException(status_code=400, detail="No PDF uploaded yet. Please upload a PDF first.")
+
     try:
-        if not ANTHROPIC_API_KEY:
-            raise ValueError("Anthropic API key not found in environment.")
+        docs_chroma = db_chroma.similarity_search_with_score(question, k=5)
+        context_text = "\n\n".join([doc.page_content for doc, _score in docs_chroma])
 
-        # Light embedding model
-        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-MiniLM-L3-v2")
+        PROMPT_TEMPLATE = """
+        Answer the question based only on the following context:
+        {context}
+        Answer the question based on the above context: {question}.
+        Provide a detailed answer.
+        Don’t justify your answers.
+        Don’t give information not mentioned in the CONTEXT INFORMATION.
+        Do not say "according to the context" or "mentioned in the context" or similar.
+        """
 
-        # Load ChromaDB with new client
-        client = PersistentClient(path=CHROMA_DIR)
-        vectorstore = Chroma(
-            client=client,
-            collection_name=COLLECTION_NAME,
-            embedding_function=embeddings
-        )
+        prompt_template = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
+        prompt = prompt_template.format(context=context_text, question=question)
 
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-        retrieved_docs = retriever.get_relevant_documents(question)
-
-        if not retrieved_docs:
-            return JSONResponse(content={"answer": "I'm not aware of that. It wasn't in the documents."})
-
-        # Call Claude model
         llm = ChatAnthropic(model="claude-3-5-sonnet-20240620", api_key=ANTHROPIC_API_KEY)
+        response_text = llm.predict(prompt)
 
-        system_prompt = (
-            "You are an assistant for answering questions based on document context. "
-            "Use the provided context below to answer the question. "
-            "If the answer is not contained in the context, say: "
-            "'I'm not aware of that. It wasn't in the documents.'\n\n"
-            "{context}"
-        )
-
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", system_prompt),
-            ("human", "{input}")
-        ])
-
-        chain = create_stuff_documents_chain(llm, prompt)
-
-        result = chain.invoke({
-            "input": question,
-            "context": retrieved_docs
-        })
-
-        return JSONResponse(content={"answer": result})
+        return JSONResponse(content={"answer": response_text})
 
     except Exception as e:
-        traceback.print_exc()
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        raise HTTPException(status_code=500, detail=f"Error generating answer: {str(e)}")

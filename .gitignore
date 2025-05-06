@@ -4,3 +4,6 @@ chroma_db/
 chroma_store/
 __pycache__/
 RAG.pem
+app.log
+chatbot_rag.pem
+ubuntu@172-31-84-21
